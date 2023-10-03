@@ -8,6 +8,8 @@ from airflow.operators.python_operator import BranchPythonOperator, PythonOperat
 from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateEmptyDatasetOperator
 from airflow.providers.google.cloud.transfers.local_to_gcs import LocalFilesystemToGCSOperator
 from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.exceptions import AirflowSkipException
 from datetime import timedelta
 
@@ -15,6 +17,8 @@ PROJ_ID = "aflow-training-rabo-2023-10-02"
 DATASET_NAME = "td_dataset"
 GCP_CONN_ID = "gcp_conn_id"
 TABLE_NAME = "launches"
+POSTGRES_CON_ID = "postgres"
+POSTGRES_TABLE_NAME = "launches"
 
 with DAG(
     dag_id="pull_space_flighs",
@@ -105,39 +109,62 @@ with DAG(
         destination_project_dataset_table=f'{PROJ_ID}.{DATASET_NAME}.{TABLE_NAME}',
         source_format='PARQUET',
         gcp_conn_id=GCP_CONN_ID,  # Airflow connection to BigQuery
-        write_disposition='WRITE_TRUNCATE',  # Specify write disposition
+        write_disposition='WRITE_APPEND',  # Specify write disposition
         dag=dag,
     )
 
-    # create_or_upsert_postgres_table = PostgresOperator(
-    #     task_id="create_or_upsert_postgres_table",
-    #     sql="""
-    #         CREATE TABLE IF NOT EXISTS pet (
-    #         id SERIAL PRIMARY KEY,
-    #         name VARCHAR NOT NULL,
-    #         status VARCHAR NOT NULL,
-    #         country_code VARCHAR NOT NULL,
-    #         service_provider_name VARCHAR NOT NULL,
-    #         service_provider_type VARCHAR NOT NULL)
-            
-    #         INSERT INTO 
-    #         customers (name, email)
-    #         VALUES 
-    #         ('IBM', 'contact@ibm.com'),
-    #         ('Microsoft', 'contact@microsoft.com'),
-    #         ('Intel', 'contact@intel.com');
-            
-    #         ;
-    #       """,
-    # )
+    create_postgres_table = PostgresOperator(
+        task_id="create_postgres_table",
+        postgres_conn_id=POSTGRES_CON_ID,
+        sql=f"""
+            CREATE TABLE IF NOT EXISTS {POSTGRES_TABLE_NAME} (
+            id VARCHAR,
+            name VARCHAR,
+            status VARCHAR,
+            country_code VARCHAR,
+            service_provider_name VARCHAR,
+            service_provider_type VARCHAR)
+            ;
+          """,
+    )
 
-    # define dag order
+    def _parquet_to_postgres(**context):
+
+        pg_hook = PostgresHook(
+            postgres_conn_id=POSTGRES_CON_ID
+        )
+        pg_conn = pg_hook.get_sqlalchemy_engine()
+
+        df = pd.read_parquet(f"/tmp/{context['ds']}.parquet")
+        df.to_sql(POSTGRES_TABLE_NAME, pg_conn, if_exists="append", index=False)
+
+
+    parquet_to_postgres = PythonOperator(
+        task_id="parquet_to_postgres",
+        python_callable=_parquet_to_postgres,
+        provide_context=True,
+        dag=dag,
+    )
+
+
+
+    # define dag base
     (
         sensor_api_live >>
         http_get_operator >>
         python_check_data_in_day >>
+        preprocess_data
+    )
+    # dag part bq
+    (
         preprocess_data >>
         create_empty_dataset_bq >>
         upload_file_gcs >>
         load_to_bigquery
+    )
+    # dag part postgreq
+    (
+        preprocess_data >>
+        create_postgres_table >>
+        parquet_to_postgres
     )
